@@ -33,7 +33,7 @@ import transformers
 import tokenizers
 
 from liquid.constants import (IGNORE_INDEX, IMAGE_TOKEN_INDEX, DEFAULT_IMAGE_TOKEN,
-                                  DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN)
+                              DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN)
 from torch.utils.data import Dataset
 from liquid.train.llava_trainer import LLaVATrainer
 
@@ -58,6 +58,69 @@ from packaging import version
 
 IS_TOKENIZER_GREATER_THAN_0_14 = version.parse(tokenizers.__version__) >= version.parse('0.14')
 os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
+
+
+def format_wp(wp):
+    return f"[{wp[0]:.2f},{wp[1]:.2f}]"
+
+
+def build_vqa_pair_with_vqcode(tokenizer, sources):
+    known_wps = sources["known_waypoints"]
+    future_wps = sources["future_waypoints"]
+
+    def make_vqtext(wp):
+        return "<boi><eoi>" + format_wp(wp)
+
+    human_text = "We already know three frames and their waypoints: " + \
+                 ", ".join([make_vqtext(wp) for wp in known_wps]) + \
+                 ", now predict the next frames, their waypoints are " + \
+                 ", ".join([format_wp(wp) for wp in future_wps])
+
+    gpt_text = ", ".join([make_vqtext(wp) for wp in future_wps])
+
+    conv = conversation_lib.default_conversation.copy()
+    conv.append_message(conv.roles[0], human_text)
+    conv.append_message(conv.roles[1], gpt_text)
+    prompt = conv.get_prompt()
+
+    input_ids = \
+    tokenizer(prompt, return_tensors="pt", truncation=True, max_length=tokenizer.model_max_length).input_ids[0]
+    instruction_len = len(
+        tokenizer(human_text, return_tensors="pt", truncation=True, max_length=tokenizer.model_max_length).input_ids[0])
+    instruction_len += 256 * 3 + 4
+
+    # 替换每对 <boi><eoi> 中插入 IMAGE_TOKEN_INDEX
+    def insert_image_token_placeholders(input_ids):
+        output = []
+        i = 0
+        while i < len(input_ids):
+            token = input_ids[i].item()
+            token_str = tokenizer.convert_ids_to_tokens(token)
+            if token_str == "<boi>":
+                output.append(token)  # <boi>
+                i += 1
+                output.append(IMAGE_TOKEN_INDEX)  # 插入占位
+                # 跳过原来的 <eoi>
+                while i < len(input_ids):
+                    token = input_ids[i].item()
+                    if tokenizer.convert_ids_to_tokens(token) == "<eoi>":
+                        output.append(token)
+                        i += 1
+                        break
+                    i += 1
+            else:
+                output.append(token)
+                i += 1
+        # eos_id = tokenizer.convert_tokens_to_ids("<eos>")
+        output.append(1)  # <eos>
+        return torch.tensor(output, dtype=torch.long)
+
+    input_ids = insert_image_token_placeholders(input_ids)
+
+    labels = input_ids.clone()
+    labels[:instruction_len] = IGNORE_INDEX
+
+    return input_ids, labels
 
 
 @dataclass
@@ -918,6 +981,17 @@ class DataCollatorForSupervisedDataset(object):
                     image=vqcode,
                     data_type=cur_data_type
                 ))
+            elif sources['data_type'] == 'waypoint_vqa':
+                input_ids, labels = build_vqa_pair_with_vqcode(self.tokenizer, sources)
+                known_vqcodes = [json.loads(s) for s in sources["known_vqcodes"]]
+                future_vqcodes = [json.loads(s) for s in sources["future_vqcodes"]]
+                vqcode = known_vqcodes + future_vqcodes
+                processed_instances.append(dict(
+                    input_ids=input_ids,
+                    labels=labels,
+                    image=vqcode,
+                    data_type=5
+                ))
             elif sources['data_type'] in ['I2T']:
                 eoi = torch.tensor([4])
                 boi = torch.tensor([3])
@@ -1010,7 +1084,8 @@ class DataCollatorForSupervisedDataset(object):
                 # Tokenize conversations
                 if has_image:
                     input_ids = torch.stack(
-                        [tokenizer_image_token(prompt, self.tokenizer, return_tensors='pt') for prompt in conversations], dim=0)
+                        [tokenizer_image_token(prompt, self.tokenizer, return_tensors='pt') for prompt in
+                         conversations], dim=0)
                     vqcode = json.loads(vqcode)
                     vqcode = torch.tensor([vqcode])  # [bz,4,256] # + len(self.tokenizer)
                 else:
@@ -1081,8 +1156,9 @@ class DataCollatorForSupervisedDataset(object):
                 text = sources['text']
                 assert text != 'no'
                 input_ids = \
-                self.tokenizer(text, return_tensors="pt", padding="longest", max_length=self.tokenizer.model_max_length,
-                               truncation=True, ).input_ids[0]
+                    self.tokenizer(text, return_tensors="pt", padding="longest",
+                                   max_length=self.tokenizer.model_max_length,
+                                   truncation=True, ).input_ids[0]
                 targets = input_ids.clone()
                 processed_instances.append(dict(
                     input_ids=input_ids,
